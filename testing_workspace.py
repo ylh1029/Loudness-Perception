@@ -69,13 +69,14 @@ python3 -m pip list
 ***************************
 ***************************
 '''
-"""A small first-pass EDA pipeline for the BIDS EEG data in sub-01."""
+"""A small first-pass EDA pipeline for one BIDS EEG participant."""
 
 from pathlib import Path
 import json
 
 import matplotlib.pyplot as plt
 import mne
+import numpy as np
 import pandas as pd
 
 
@@ -83,11 +84,12 @@ import pandas as pd
 # .vhdr. The *_eeg.json, *_channels.tsv, and *_events.tsv files describe it.
 # Resolve paths from this script so it works from any current working directory.
 DATASET_DIR = Path(__file__).resolve().parent / "dummy_data" / "ds007615"
-EEG_DIR = DATASET_DIR / "sub-01" / "eeg"
+SUBJECT_ID = "sub-03"  # Change this to another subject folder, e.g. "sub-01".
+EEG_DIR = DATASET_DIR / SUBJECT_ID / "eeg"
+OUTPUT_DIR = DATASET_DIR / "eda_output" / SUBJECT_ID
 
-# Choose which recording to plot when raw files are available. Set to None to use
-# the first recording with complete BrainVision files.
-PLOT_RECORDING = "sub-01_task-rest_acq-ec"
+# Set a recording stem here, or leave None to use the first complete recording.
+PLOT_RECORDING = None
 
 
 def load_sidecars(eeg_json_path):
@@ -232,20 +234,24 @@ def plot_metadata(recordings):
             marker = str(event["trial_type"]).rsplit("_", 1)[-1]
             rest_rows.append((f"{condition}: {marker}", event["onset"]))
 
-    rest_labels = [
-        "eyes closed: start",
-        "eyes closed: end",
-        "eyes open: start",
-        "eyes open: end",
-    ]
-    rest_y = {label: index for index, label in enumerate(rest_labels)}
-    for label, onset in rest_rows:
-        color = "tab:green" if label.endswith("start") else "tab:red"
-        rest_ax.scatter(onset, rest_y[label], color=color, s=45)
-    rest_ax.set_yticks(range(len(rest_labels)), rest_labels)
-    rest_ax.set_xlabel("Seconds from recording start")
-    rest_ax.set_title("Resting-state start/end markers")
-    rest_ax.grid(axis="x", alpha=0.25)
+    if rest_rows:
+        rest_labels = [
+            "eyes closed: start",
+            "eyes closed: end",
+            "eyes open: start",
+            "eyes open: end",
+        ]
+        rest_y = {label: index for index, label in enumerate(rest_labels)}
+        for label, onset in rest_rows:
+            color = "tab:green" if label.endswith("start") else "tab:red"
+            rest_ax.scatter(onset, rest_y[label], color=color, s=45)
+        rest_ax.set_yticks(range(len(rest_labels)), rest_labels)
+        rest_ax.set_xlabel("Seconds from recording start")
+        rest_ax.set_title("Resting-state start/end markers")
+        rest_ax.grid(axis="x", alpha=0.25)
+    else:
+        rest_ax.axis("off")
+        rest_ax.text(0.5, 0.5, "No resting-state event file for this subject", ha="center")
 
     # Channel counts come from channels.tsv; this is not a sensor-position map.
     channels = recordings[ldaep_name]["channels"]
@@ -259,22 +265,18 @@ def plot_metadata(recordings):
     fig.tight_layout()
 
     # Save a copy so the figure is available after the script exits.
-    output_dir = DATASET_DIR / "eda_output"
-    output_dir.mkdir(exist_ok=True)
-    output_path = output_dir / "metadata_eda.png"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = OUTPUT_DIR / "metadata_eda.png"
     fig.savefig(output_path, dpi=160, bbox_inches="tight")
     print(f"\nSaved metadata visualization to: {output_path}")
-    plt.show()
+    plt.close(fig)
 
 
-def inspect_raw(raw_by_name):
-    """Print a basic signal summary and open two standard MNE views."""
+def inspect_raw(raw_by_name, recordings):
+    """Summarize real signal data and save a trace, PSD, and ERP figure."""
     if not raw_by_name:
         print(
-            "\nRaw EEG signals are unavailable: this folder has broken Git-annex "
-            "pointers for the .vhdr/.vmrk/.eeg files. The JSON, channels.tsv, and "
-            "events.tsv metadata were still explored above. Restore/download the "
-            "BrainVision triplets to run signal plots and summaries."
+            "\nNo complete BrainVision triplet was found. Metadata plots were still saved."
         )
         return
 
@@ -306,16 +308,103 @@ def inspect_raw(raw_by_name):
             "peak_to_peak_uV": eeg_data_microvolts.max(axis=1) - eeg_data_microvolts.min(axis=1),
         }
     )
-    print("\nFirst 10 seconds of EEG (microvolts; descriptive only)")
+    print("\nFirst 10 seconds of raw EEG (µV; means include DC offsets, descriptive only)")
     print(signal_summary.round(2).to_string(index=False))
 
-    # Browse a short multichannel time window, then inspect its frequency content.
-    raw.plot(n_channels=min(20, len(raw.ch_names)), duration=10, scalings="auto")
-    raw.compute_psd(picks="eeg", fmax=60).plot()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Filter a copy for an easier-to-read trace; the original Raw data stay unchanged.
+    trace_channels = [name for name in ("Fz", "Cz", "Pz") if name in raw.ch_names]
+    trace_raw = raw.copy().pick(trace_channels).load_data()
+    trace_raw.filter(l_freq=0.5, h_freq=30.0, verbose="ERROR")
+    trace_data_uv = trace_raw.get_data() * 1e6
+    trace_stop = min(trace_raw.n_times, int(10 * trace_raw.info["sfreq"]))
+
+    # Welch PSD on the unfiltered Cz signal can reveal broad spectral shape and 50-Hz noise.
+    spectrum = raw.compute_psd(
+        method="welch",
+        fmin=0.5,
+        fmax=100,
+        picks=["Cz"] if "Cz" in raw.ch_names else [trace_channels[0]],
+        n_fft=int(2 * raw.info["sfreq"]),
+        verbose="ERROR",
+    )
+    psd, frequencies = spectrum.get_data(return_freqs=True)
+
+    # Use event.tsv sample indices to cut one-second EEG trials around each tone.
+    ldaep_name = next(name for name in recordings if "task-ldaep" in name)
+    events_table = recordings[ldaep_name]["events"]
+    event_id = events_table.groupby("trial_type")["value"].first().astype(int).to_dict()
+    events_array = np.column_stack(
+        (
+            events_table["sample"].astype(int).to_numpy() + raw.first_samp,
+            np.zeros(len(events_table), dtype=int),
+            events_table["value"].astype(int).to_numpy(),
+        )
+    )
+
+    # This light 0.5-30 Hz filter and pre-tone baseline are for visualization only.
+    erp_channel = "Cz" if "Cz" in raw.ch_names else trace_channels[0]
+    erp_raw = raw.copy().pick([erp_channel]).load_data()
+    erp_raw.filter(l_freq=0.5, h_freq=30.0, verbose="ERROR")
+    epochs = mne.Epochs(
+        erp_raw,
+        events_array,
+        event_id=event_id,
+        tmin=-0.2,
+        tmax=0.8,
+        baseline=(-0.2, 0),
+        preload=True,
+        verbose="ERROR",
+    )
+    print("\nLDAEP epochs extracted by sound level (no amplitude-based artifact rejection)")
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 12))
+
+    # Plot a short real EEG segment after filtering to remove slow drift and high-frequency noise.
+    times = trace_raw.times[:trace_stop]
+    for channel_index, channel_name in enumerate(trace_channels):
+        axes[0].plot(times, trace_data_uv[channel_index, :trace_stop], label=channel_name, linewidth=0.8)
+    axes[0].set_title("EEG time series: first 10 seconds, 0.5–30 Hz filtered")
+    axes[0].set_xlabel("Time (seconds)")
+    axes[0].set_ylabel("Voltage (µV)")
+    axes[0].legend(ncol=len(trace_channels))
+
+    # Display PSD in dB/Hz and mark the dataset's 50-Hz power-line frequency.
+    axes[1].plot(frequencies, 10 * np.log10(np.maximum(psd[0], np.finfo(float).tiny)))
+    axes[1].axvline(50, color="tab:red", linestyle="--", label="50 Hz power line")
+    axes[1].set_title("Cz power spectral density (unfiltered recording)")
+    axes[1].set_xlabel("Frequency (Hz)")
+    axes[1].set_ylabel("Power (dB/Hz)")
+    axes[1].legend()
+
+    # Average the tone-locked epochs separately for each sound level.
+    for condition in sorted(event_id, key=lambda label: int(label.rsplit("_", 1)[1])):
+        condition_epochs = epochs[condition]
+        evoked = condition_epochs.average()
+        axes[2].plot(
+            evoked.times * 1000,
+            evoked.data[0] * 1e6,
+            label=f"{condition} (n={len(condition_epochs)})",
+        )
+        print(f"{condition}: {len(condition_epochs)} epochs")
+    axes[2].axvline(0, color="black", linestyle="--", linewidth=0.8)
+    axes[2].axhline(0, color="black", linewidth=0.6)
+    axes[2].set_title(f"Average tone-locked response at {erp_channel}")
+    axes[2].set_xlabel("Time from tone onset (ms)")
+    axes[2].set_ylabel("Baseline-corrected voltage (µV)")
+    axes[2].legend()
+
+    fig.suptitle(f"{SUBJECT_ID}: first-pass LDAEP signal EDA")
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    output_path = OUTPUT_DIR / "signal_eda.png"
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved signal visualization to: {output_path}")
 
 
 if __name__ == "__main__":
     recording_data, _ = inspect_metadata()
     plot_metadata(recording_data)
     loaded_raw = load_raw_recordings(recording_data)
-    inspect_raw(loaded_raw)
+    inspect_raw(loaded_raw, recording_data)
