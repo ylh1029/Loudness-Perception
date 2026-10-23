@@ -1,0 +1,13 @@
+
+# Python virtual environment
+.venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+
+# Keep the separately cloned dataset out of this repository
+ds007615/
