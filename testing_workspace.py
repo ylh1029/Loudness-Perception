@@ -1,4 +1,4 @@
-'''
+r'''
 ***************************
 CREATE VIRTUAL ENVIRONMENT
 ***************************
@@ -74,6 +74,7 @@ python3 -m pip list
 from pathlib import Path
 import json
 
+import matplotlib.pyplot as plt
 import mne
 import pandas as pd
 
@@ -186,6 +187,86 @@ def load_raw_recordings(recordings):
     return raw_by_name
 
 
+def plot_metadata(recordings):
+    """Plot event timing and channel inventory from the available sidecars."""
+    ldaep_name = next(name for name in recordings if "task-ldaep" in name)
+    ldaep_events = recordings[ldaep_name]["events"]
+    ldaep_labels = sorted(
+        ldaep_events["trial_type"].unique(),
+        key=lambda label: int(label.rsplit("_", 1)[1]),
+    )
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+
+    # Each dot is a stimulus marker from events.tsv, not a measured EEG value.
+    timeline_ax = axes[0, 0]
+    for y_position, label in enumerate(ldaep_labels):
+        matching_events = ldaep_events[ldaep_events["trial_type"] == label]
+        timeline_ax.scatter(
+            matching_events["onset"] / 60,
+            [y_position] * len(matching_events),
+            s=12,
+            label=label,
+        )
+    timeline_ax.set_yticks(range(len(ldaep_labels)), ldaep_labels)
+    timeline_ax.set_xlabel("Minutes from recording start")
+    timeline_ax.set_title("LDAEP stimulus event timeline")
+    timeline_ax.grid(axis="x", alpha=0.25)
+
+    # Count how many event markers were recorded for each sound level.
+    count_ax = axes[0, 1]
+    event_counts = ldaep_events["trial_type"].value_counts().reindex(ldaep_labels)
+    count_ax.bar(ldaep_labels, event_counts.values)
+    count_ax.set_xlabel("LDAEP event type / sound level")
+    count_ax.set_ylabel("Number of markers")
+    count_ax.set_title("LDAEP event counts")
+
+    # Rest markers show task start/end timing; they do not contain signal samples.
+    rest_ax = axes[1, 0]
+    rest_rows = []
+    for name, data in recordings.items():
+        if "task-rest" not in name:
+            continue
+        condition = "eyes closed" if "acq-ec" in name else "eyes open"
+        for _, event in data["events"].iterrows():
+            marker = str(event["trial_type"]).rsplit("_", 1)[-1]
+            rest_rows.append((f"{condition}: {marker}", event["onset"]))
+
+    rest_labels = [
+        "eyes closed: start",
+        "eyes closed: end",
+        "eyes open: start",
+        "eyes open: end",
+    ]
+    rest_y = {label: index for index, label in enumerate(rest_labels)}
+    for label, onset in rest_rows:
+        color = "tab:green" if label.endswith("start") else "tab:red"
+        rest_ax.scatter(onset, rest_y[label], color=color, s=45)
+    rest_ax.set_yticks(range(len(rest_labels)), rest_labels)
+    rest_ax.set_xlabel("Seconds from recording start")
+    rest_ax.set_title("Resting-state start/end markers")
+    rest_ax.grid(axis="x", alpha=0.25)
+
+    # Channel counts come from channels.tsv; this is not a sensor-position map.
+    channels = recordings[ldaep_name]["channels"]
+    channel_counts = channels["type"].value_counts().sort_index()
+    channel_ax = axes[1, 1]
+    channel_ax.bar(channel_counts.index, channel_counts.values)
+    channel_ax.set_ylabel("Number of channels")
+    channel_ax.set_title("Channel types")
+
+    fig.suptitle("Available EEG metadata (no EEG voltage data plotted)")
+    fig.tight_layout()
+
+    # Save a copy so the figure is available after the script exits.
+    output_dir = DATASET_DIR / "eda_output"
+    output_dir.mkdir(exist_ok=True)
+    output_path = output_dir / "metadata_eda.png"
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    print(f"\nSaved metadata visualization to: {output_path}")
+    plt.show()
+
+
 def inspect_raw(raw_by_name):
     """Print a basic signal summary and open two standard MNE views."""
     if not raw_by_name:
@@ -235,5 +316,6 @@ def inspect_raw(raw_by_name):
 
 if __name__ == "__main__":
     recording_data, _ = inspect_metadata()
+    plot_metadata(recording_data)
     loaded_raw = load_raw_recordings(recording_data)
     inspect_raw(loaded_raw)
